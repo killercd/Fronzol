@@ -1,12 +1,121 @@
 #define _POSIX_C_SOURCE 200112L
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>  
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <openssl/ssl.h>
 #include "browser.h"
+
+#define READ_BUFFER_SIZE 65536
+
+static int connect_to_host(const char *host, const char *port)
+{
+    struct addrinfo hints, *res, *p;
+    int sck_connect;
+    int status;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    status = getaddrinfo(host, port, &hints, &res);
+    if(status!=0)
+        return -1;
+
+    sck_connect = -1;
+    for(p=res; p!=NULL; p=p->ai_next){
+        sck_connect = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if(sck_connect==-1)
+            continue;
+
+        if(connect(sck_connect, p->ai_addr, p->ai_addrlen)==0)
+            break;
+
+        close(sck_connect);
+        sck_connect = -1;
+    }
+
+    freeaddrinfo(res);
+    return sck_connect;
+}
+
+static int send_all_socket(int fd, const char *data, size_t len)
+{
+    size_t sent = 0;
+
+    while(sent<len){
+        ssize_t ret = send(fd, data+sent, len-sent, 0);
+        if(ret<=0)
+            return -1;
+        sent += (size_t)ret;
+    }
+
+    return 0;
+}
+
+static int send_all_ssl(SSL *ssl, const char *data, size_t len)
+{
+    size_t sent = 0;
+
+    while(sent<len){
+        int ret = SSL_write(ssl, data+sent, (int)(len-sent));
+        if(ret<=0)
+            return -1;
+        sent += (size_t)ret;
+    }
+
+    return 0;
+}
+
+static char *find_body_start(char *data, size_t len)
+{
+    if(data==NULL || len<4)
+        return NULL;
+
+    for(size_t i=0; i<len-3; i++){
+        if(data[i]=='\r' && data[i+1]=='\n' && data[i+2]=='\r' && data[i+3]=='\n')
+            return data+i+4;
+    }
+
+    return NULL;
+}
+
+static int append_data(char **data, size_t *len, size_t *capacity, const char *chunk, size_t chunk_len)
+{
+    char *new_data;
+    size_t needed;
+    size_t new_capacity;
+
+    if(chunk_len==0)
+        return 0;
+
+    needed = *len + chunk_len + 1;
+    if(needed<=*capacity){
+        memcpy(*data + *len, chunk, chunk_len);
+        *len += chunk_len;
+        (*data)[*len] = '\0';
+        return 0;
+    }
+
+    new_capacity = *capacity==0 ? READ_BUFFER_SIZE : *capacity;
+    while(new_capacity<needed)
+        new_capacity *= 2;
+
+    new_data = realloc(*data, new_capacity);
+    if(new_data==NULL)
+        return -1;
+
+    *data = new_data;
+    *capacity = new_capacity;
+    memcpy(*data + *len, chunk, chunk_len);
+    *len += chunk_len;
+    (*data)[*len] = '\0';
+    return 0;
+}
 
 
 /** Split parameters of url to obtain protocol
@@ -46,84 +155,121 @@ void loadrequest(Request_info *request_info, char *raw_url){
         strncpy(request_info->host, host_start, sizeof(request_info->host)-1);
     }
 
-    printf("PROTO: %s\n", request_info->proto);
-    printf("URL: %s\n", request_info->host);
-    printf("PARAMS: %s\n", request_info->url_params);
 }
 
 
-BRWS_STATUS getpage(Request_info *request_info, char *retdata, int maxlen){
-    printf("INIT GETPAGE\n");
+BRWS_STATUS getpage(Request_info *request_info, char **retdata, size_t *retlen){
     char data_send[MAX_URL_LENGTH+1000];  
-    char ret_buff[1024];
-    struct addrinfo hints, *res, *p;
-    int sck_connect, s_status, b_recv;
-    int status;
-    int data_counter = 0;
-    char *data_ptr = retdata;
+    char ret_buff[READ_BUFFER_SIZE];
+    int sck_connect, b_recv;
+    int use_ssl;
+    const char *port;
+    SSL_CTX *ssl_ctx = NULL;
+    SSL *ssl = NULL;
+    size_t capacity = 0;
+    char *body_ptr;
 
-    memset(retdata, 0, (size_t)maxlen);
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+    if(retdata==NULL || retlen==NULL)
+        return DATA_RECV;
 
-    status = getaddrinfo(request_info->host, "80", &hints, &res);
-    if(status!=0)
+    *retdata = NULL;
+    *retlen = 0;
+
+    use_ssl = strcmp(request_info->proto, "https")==0;
+    if(strcmp(request_info->proto, "http")!=0 && !use_ssl)
         return INVALID_ADDRESS;
 
-    sck_connect = -1;
-    for(p=res; p!=NULL; p=p->ai_next){
-        sck_connect = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if(sck_connect==-1)
-            continue;
-
-        if(connect(sck_connect, p->ai_addr, p->ai_addrlen)==0)
-            break;
-
-        close(sck_connect);
-        sck_connect = -1;
-    }
-
-    freeaddrinfo(res);
-
+    port = use_ssl ? "443" : "80";
+    sck_connect = connect_to_host(request_info->host, port);
     if(sck_connect==-1)
         return CONNECTION_ERROR;
-    
-    snprintf(data_send, 
-            sizeof(data_send), 
+
+    if(use_ssl){
+        OPENSSL_init_ssl(0, NULL);
+        ssl_ctx = SSL_CTX_new(TLS_client_method());
+        if(ssl_ctx==NULL){
+            close(sck_connect);
+            return CONNECTION_ERROR;
+        }
+        SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_3_VERSION);
+        SSL_CTX_set_max_proto_version(ssl_ctx, TLS1_3_VERSION);
+
+        ssl = SSL_new(ssl_ctx);
+        if(ssl==NULL){
+            SSL_CTX_free(ssl_ctx);
+            close(sck_connect);
+            return CONNECTION_ERROR;
+        }
+
+        SSL_set_tlsext_host_name(ssl, request_info->host);
+        SSL_set_fd(ssl, sck_connect);
+
+        if(SSL_connect(ssl)<=0){
+            SSL_free(ssl);
+            SSL_CTX_free(ssl_ctx);
+            close(sck_connect);
+            return CONNECTION_ERROR;
+        }
+    }
+
+    snprintf(data_send,
+            sizeof(data_send),
             "GET /%s HTTP/1.1\r\n"
             "Host: %s\r\n"
+            "User-Agent: Fronzol/1.0\r\n"
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
             "Connection: close\r\n"
             "\r\n",
             request_info->url_params,
             request_info->host);
 
-    s_status = send(sck_connect, data_send, strlen(data_send),0);
-    if(s_status<0){
+    if(use_ssl){
+        if(send_all_ssl(ssl, data_send, strlen(data_send))<0){
+            SSL_free(ssl);
+            SSL_CTX_free(ssl_ctx);
+            close(sck_connect);
+            return SEND_ERROR;
+        }
+    }
+    else if(send_all_socket(sck_connect, data_send, strlen(data_send))<0){
         close(sck_connect);
         return SEND_ERROR;
     }
 
-    while((b_recv = recv(sck_connect, ret_buff, sizeof(ret_buff)-1, 0))>0){
-        ret_buff[b_recv] = '\0';
-        printf("%s", ret_buff);
-
-        //max size of string reached
-        if(data_counter>=maxlen)
-            break;
-
-        for(int i=0; i<b_recv && data_counter<maxlen-1; i++){
-            *data_ptr = ret_buff[i];
-            data_ptr++;
-            data_counter++;
+    while((b_recv = use_ssl ? SSL_read(ssl, ret_buff, sizeof(ret_buff)-1) :
+                              recv(sck_connect, ret_buff, sizeof(ret_buff)-1, 0))>0){
+        if(append_data(retdata, retlen, &capacity, ret_buff, (size_t)b_recv)<0){
+            if(ssl!=NULL){
+                SSL_free(ssl);
+            }
+            if(ssl_ctx!=NULL)
+                SSL_CTX_free(ssl_ctx);
+            close(sck_connect);
+            free(*retdata);
+            *retdata = NULL;
+            *retlen = 0;
+            return DATA_RECV;
         }
     }
 
-    *data_ptr = '\0';
+    if(ssl!=NULL){
+        SSL_free(ssl);
+    }
+    if(ssl_ctx!=NULL)
+        SSL_CTX_free(ssl_ctx);
     close(sck_connect);
 
     if(b_recv<0)
         return DATA_RECV;
+
+    body_ptr = find_body_start(*retdata, *retlen);
+    if(body_ptr!=NULL){
+        size_t body_len = *retlen - (size_t)(body_ptr - *retdata);
+
+        memmove(*retdata, body_ptr, body_len);
+        *retlen = body_len;
+        (*retdata)[*retlen] = '\0';
+    }
 
     return OK;
 }
@@ -146,7 +292,6 @@ void parse_error(BRWS_STATUS error){
             printf("Data Recv\n");
             break;
         case OK:
-            printf("OK\n");
             break;
         default:
             printf("????\n");

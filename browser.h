@@ -7,6 +7,7 @@
 
 #define MAX_URL_LENGTH 2048
 
+#include <stddef.h>
 #include <netdb.h>
 
 typedef enum {
@@ -29,7 +30,7 @@ typedef struct Request_info {
 
 
 void loadrequest(Request_info *request_info, char *raw_url);
-BRWS_STATUS getpage(Request_info *request_info, char *retdat, int maxlen);
+BRWS_STATUS getpage(Request_info *request_info, char **retdata, size_t *retlen);
 void parse_error(BRWS_STATUS error);
 
 
