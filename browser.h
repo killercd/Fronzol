@@ -7,6 +7,8 @@
 
 #define MAX_URL_LENGTH 2048
 
+#include <netdb.h>
+
 typedef enum {
     INVALID_ADDRESS = 0,
     SOCKET_ERROR = 1,
@@ -23,6 +25,7 @@ typedef struct Request_info {
     char host[MAX_HOST_LENGTH];
     char url_params[MAX_URL_PARAMS];
 } Request_info;
+
 
 
 void loadrequest(Request_info *request_info, char *raw_url);

@@ -15,7 +15,7 @@ void crop_new_line(char *str){
     }
 }
 
-int main(){
+int main(int argc, char *argv[]){
 
     char url[MAX_URL_LENGTH];
     char response[1024];
@@ -25,9 +25,14 @@ int main(){
     
     memset(&r_info, 0, sizeof(r_info));
 
-     
-    printf("URL: ");
-    fgets(url, MAX_URL_LENGTH-1, stdin);
+    
+    //printf("URL: ");
+    //fgets(url, MAX_URL_LENGTH-1, stdin);
+    if(argc<2){
+        printf("Params error\n");
+        return -1;
+    }
+    strncpy(url, argv[1], MAX_URL_LENGTH-1);
     crop_new_line(url);
     loadrequest(&r_info, url);
     BRWS_STATUS ret_code = getpage(&r_info, response, 1020);
